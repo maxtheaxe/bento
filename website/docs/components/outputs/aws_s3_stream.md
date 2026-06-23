@@ -101,6 +101,17 @@ partition values. Messages with matching partition values are written to the sam
 path expression is evaluated only once per partition (allowing use of functions like `uuid_v4()`
 for unique filenames). Without `partition_by`, each message evaluates the full path independently.
 
+Messages are acknowledged only after their bytes are durably represented in S3. Buffered bytes are
+not acknowledged while they are only held in memory, and the final buffered bytes are acknowledged
+only after the multipart upload is completed successfully.
+
+On restart this output attempts to recover one in-progress multipart upload for the exact same S3
+path by using S3 multipart listing APIs. This means crash recovery requires a deterministic `path`
+that redelivered messages can recompute exactly. Paths using nondeterministic functions such as
+`uuid_v4()` or the current timestamp are not crash-recoverable without a future manifest or cache
+feature, unless they still recompute the exact same S3 key. Duplicate records can appear after a
+crash and should be tolerated downstream.
+
 ## When to Use
 
 Use `aws_s3_stream` instead of `aws_s3` when:
