@@ -23,6 +23,9 @@ const (
 	ssoFieldMaxBufferBytes     = "max_buffer_bytes"
 	ssoFieldMaxBufferCount     = "max_buffer_count"
 	ssoFieldMaxBufferPeriod    = "max_buffer_period"
+	ssoFieldMaxFileBytes       = "max_file_bytes"
+	ssoFieldMaxFileCount       = "max_file_count"
+	ssoFieldMaxFilePeriod      = "max_file_period"
 	ssoFieldBatching           = "batching"
 	ssoFieldContentType        = "content_type"
 	ssoFieldContentEncoding    = "content_encoding"
@@ -86,8 +89,20 @@ You can find out more [in this document](/docs/guides/cloud/aws).
 				Default(10000).
 				Advanced(),
 			service.NewDurationField(ssoFieldMaxBufferPeriod).
-				Description("Maximum duration to buffer messages before flushing to S3.").
+				Description("Maximum duration to buffer messages before flushing a part to S3.").
 				Default("10s").
+				Advanced(),
+			service.NewIntField(ssoFieldMaxFileBytes).
+				Description("Maximum number of bytes to write to an S3 object before completing the multipart upload and starting a new object for subsequent messages. Set to zero to disable byte based rotation.").
+				Default(0).
+				Advanced(),
+			service.NewIntField(ssoFieldMaxFileCount).
+				Description("Maximum number of messages to write to an S3 object before completing the multipart upload and starting a new object for subsequent messages. Set to zero to disable count based rotation.").
+				Default(0).
+				Advanced(),
+			service.NewDurationField(ssoFieldMaxFilePeriod).
+				Description("Maximum age of an active S3 object before completing the multipart upload and starting a new object for subsequent messages. This threshold is evaluated when messages are written. Set to zero to disable age based rotation.").
+				Default("0s").
 				Advanced(),
 			service.NewInterpolatedStringField(ssoFieldContentType).
 				Description("The content type to set for uploaded files.").
@@ -157,6 +172,9 @@ type s3StreamConfig struct {
 	MaxBufferBytes  int64
 	MaxBufferCount  int
 	MaxBufferPeriod time.Duration
+	MaxFileBytes    int64
+	MaxFileCount    int
+	MaxFilePeriod   time.Duration
 	ContentType     *service.InterpolatedString
 	ContentEncoding *service.InterpolatedString
 
@@ -196,6 +214,20 @@ func s3StreamConfigFromParsed(pConf *service.ParsedConfig) (conf s3StreamConfig,
 	}
 
 	if conf.MaxBufferPeriod, err = pConf.FieldDuration(ssoFieldMaxBufferPeriod); err != nil {
+		return
+	}
+
+	var maxFileBytes int
+	if maxFileBytes, err = pConf.FieldInt(ssoFieldMaxFileBytes); err != nil {
+		return
+	}
+	conf.MaxFileBytes = int64(maxFileBytes)
+
+	if conf.MaxFileCount, err = pConf.FieldInt(ssoFieldMaxFileCount); err != nil {
+		return
+	}
+
+	if conf.MaxFilePeriod, err = pConf.FieldDuration(ssoFieldMaxFilePeriod); err != nil {
 		return
 	}
 
@@ -257,18 +289,23 @@ func init() {
 type s3StreamOutput struct {
 	conf     s3StreamConfig
 	log      *service.Logger
-	s3Client *s3.Client
+	s3Client s3StreamingAPI
 
 	// Writer pool for managing multiple partition paths
 	writersMut sync.RWMutex
-	writers    map[string]*S3StreamingWriter
+	writers    map[string]*s3StreamPartitionWriter
+}
+
+type s3StreamPartitionWriter struct {
+	mut    sync.Mutex
+	writer *S3StreamingWriter
 }
 
 func newS3StreamOutput(conf s3StreamConfig, mgr *service.Resources) (*s3StreamOutput, error) {
 	return &s3StreamOutput{
 		conf:    conf,
 		log:     mgr.Logger(),
-		writers: make(map[string]*S3StreamingWriter),
+		writers: make(map[string]*s3StreamPartitionWriter),
 	}, nil
 }
 
@@ -347,64 +384,23 @@ func (s *s3StreamOutput) WriteBatch(ctx context.Context, batch service.MessageBa
 }
 
 func (s *s3StreamOutput) writeToPartition(ctx context.Context, partitionKey string, path string, batch service.MessageBatch) error {
-	// Try to get existing writer with read lock
-	s.writersMut.RLock()
-	writer, exists := s.writers[partitionKey]
-	s.writersMut.RUnlock()
+	pw, err := s.getOrCreatePartitionWriter(ctx, partitionKey, path, batch)
+	if err != nil {
+		return err
+	}
 
-	if !exists {
-		// Need to create writer - acquire write lock
-		s.writersMut.Lock()
-		// Double-check that another goroutine didn't create it while we were waiting
-		writer, exists = s.writers[partitionKey]
-		if !exists {
-			// Evaluate content type and encoding for this partition (uses first message in batch)
-			var contentType string
-			var contentEncoding string
-			var err error
+	pw.mut.Lock()
+	defer pw.mut.Unlock()
 
-			if len(batch) > 0 {
-				contentType, err = batch.TryInterpolatedString(0, s.conf.ContentType)
-				if err != nil {
-					s.writersMut.Unlock()
-					return fmt.Errorf("failed to evaluate content_type: %w", err)
-				}
-
-				if s.conf.ContentEncoding != nil {
-					contentEncoding, err = batch.TryInterpolatedString(0, s.conf.ContentEncoding)
-					if err != nil {
-						s.writersMut.Unlock()
-						return fmt.Errorf("failed to evaluate content_encoding: %w", err)
-					}
-				}
-			}
-
-			newWriter, err := NewS3StreamingWriter(S3StreamingWriterConfig{
-				S3Client:        s.s3Client,
-				Bucket:          s.conf.Bucket,
-				Key:             path,
-				MaxBufferBytes:  s.conf.MaxBufferBytes,
-				MaxBufferCount:  s.conf.MaxBufferCount,
-				MaxBufferPeriod: s.conf.MaxBufferPeriod,
-				ContentType:     contentType,
-				ContentEncoding: contentEncoding,
-				BackoffCtor:     s.conf.backoffCtor,
-			})
-			if err != nil {
-				s.writersMut.Unlock()
-				return fmt.Errorf("failed to create writer: %w", err)
-			}
-
-			if err := newWriter.Initialize(ctx); err != nil {
-				s.writersMut.Unlock()
-				return fmt.Errorf("failed to initialize writer: %w", err)
-			}
-
-			s.writers[partitionKey] = newWriter
-			writer = newWriter
-			s.log.Debugf("Created new streaming writer for path: %s", path)
+	if s.shouldRotateWriter(pw.writer) {
+		if err := s.closePartitionWriter(ctx, partitionKey, pw); err != nil {
+			return err
 		}
-		s.writersMut.Unlock()
+		if pw, err = s.getOrCreatePartitionWriter(ctx, partitionKey, path, batch); err != nil {
+			return err
+		}
+		pw.mut.Lock()
+		defer pw.mut.Unlock()
 	}
 
 	// Write messages to writer
@@ -414,33 +410,137 @@ func (s *s3StreamOutput) writeToPartition(ctx context.Context, partitionKey stri
 			return fmt.Errorf("failed to get message bytes: %w", err)
 		}
 
-		if err := writer.WriteBytes(ctx, msgBytes); err != nil {
+		if err := pw.writer.WriteBytes(ctx, msgBytes); err != nil {
 			return fmt.Errorf("failed to write message: %w", err)
+		}
+	}
+
+	if s.shouldRotateWriter(pw.writer) {
+		if err := s.closePartitionWriter(ctx, partitionKey, pw); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func (s *s3StreamOutput) Close(ctx context.Context) error {
+func (s *s3StreamOutput) getOrCreatePartitionWriter(ctx context.Context, partitionKey string, path string, batch service.MessageBatch) (*s3StreamPartitionWriter, error) {
+	s.writersMut.RLock()
+	pw, exists := s.writers[partitionKey]
+	s.writersMut.RUnlock()
+	if exists {
+		return pw, nil
+	}
+
 	s.writersMut.Lock()
 	defer s.writersMut.Unlock()
 
-	s.log.Debugf("Closing %d active writers", len(s.writers))
+	if pw, exists = s.writers[partitionKey]; exists {
+		return pw, nil
+	}
 
-	var lastErr error
-	for path, writer := range s.writers {
-		stats := writer.Stats()
-		s.log.Debugf("Closing writer for %s (messages: %d, parts: %d, bytes: %d)",
-			path, stats.TotalMessages, stats.PartsUploaded, stats.TotalBytes)
+	// Evaluate content type and encoding for this partition (uses first message in batch)
+	var contentType string
+	var contentEncoding string
+	var err error
 
-		if err := writer.Close(ctx); err != nil {
-			s.log.Errorf("Failed to close writer for %s: %v", path, err)
-			lastErr = err
+	if len(batch) > 0 {
+		contentType, err = batch.TryInterpolatedString(0, s.conf.ContentType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to evaluate content_type: %w", err)
+		}
+
+		if s.conf.ContentEncoding != nil {
+			contentEncoding, err = batch.TryInterpolatedString(0, s.conf.ContentEncoding)
+			if err != nil {
+				return nil, fmt.Errorf("failed to evaluate content_encoding: %w", err)
+			}
 		}
 	}
 
-	s.writers = make(map[string]*S3StreamingWriter)
+	newWriter, err := NewS3StreamingWriter(S3StreamingWriterConfig{
+		S3Client:        s.s3Client,
+		Bucket:          s.conf.Bucket,
+		Key:             path,
+		MaxBufferBytes:  s.conf.MaxBufferBytes,
+		MaxBufferCount:  s.conf.MaxBufferCount,
+		MaxBufferPeriod: s.conf.MaxBufferPeriod,
+		ContentType:     contentType,
+		ContentEncoding: contentEncoding,
+		BackoffCtor:     s.conf.backoffCtor,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create writer: %w", err)
+	}
+
+	if err := newWriter.Initialize(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize writer: %w", err)
+	}
+
+	pw = &s3StreamPartitionWriter{writer: newWriter}
+	s.writers[partitionKey] = pw
+	s.log.Debugf("Created new streaming writer for path: %s", path)
+	return pw, nil
+}
+
+func (s *s3StreamOutput) shouldRotateWriter(writer *S3StreamingWriter) bool {
+	stats := writer.Stats()
+	if s.conf.MaxFileBytes > 0 && stats.TotalBytes >= s.conf.MaxFileBytes {
+		return true
+	}
+	if s.conf.MaxFileCount > 0 && stats.TotalMessages >= int64(s.conf.MaxFileCount) {
+		return true
+	}
+	if s.conf.MaxFilePeriod > 0 && stats.Age >= s.conf.MaxFilePeriod {
+		return true
+	}
+	return false
+}
+
+func (s *s3StreamOutput) closePartitionWriter(ctx context.Context, partitionKey string, pw *s3StreamPartitionWriter) error {
+	stats := pw.writer.Stats()
+	s.log.Debugf("Completing writer for %s (messages: %d, parts: %d, bytes: %d)",
+		partitionKey, stats.TotalMessages, stats.PartsUploaded, stats.TotalBytes)
+
+	if err := pw.writer.Close(ctx); err != nil {
+		return fmt.Errorf("failed to complete writer for %s: %w", partitionKey, err)
+	}
+
+	s.writersMut.Lock()
+	if s.writers[partitionKey] == pw {
+		delete(s.writers, partitionKey)
+	}
+	s.writersMut.Unlock()
+	return nil
+}
+
+func (s *s3StreamOutput) Close(ctx context.Context) error {
+	s.writersMut.RLock()
+	writers := make(map[string]*s3StreamPartitionWriter, len(s.writers))
+	for path, writer := range s.writers {
+		writers[path] = writer
+	}
+	s.writersMut.RUnlock()
+
+	s.log.Debugf("Closing %d active writers", len(writers))
+
+	var lastErr error
+	for path, pw := range writers {
+		pw.mut.Lock()
+		stats := pw.writer.Stats()
+		s.log.Debugf("Closing writer for %s (messages: %d, parts: %d, bytes: %d)",
+			path, stats.TotalMessages, stats.PartsUploaded, stats.TotalBytes)
+
+		if err := pw.writer.Close(ctx); err != nil {
+			s.log.Errorf("Failed to close writer for %s: %v", path, err)
+			lastErr = err
+		}
+		pw.mut.Unlock()
+	}
+
+	s.writersMut.Lock()
+	s.writers = make(map[string]*s3StreamPartitionWriter)
+	s.writersMut.Unlock()
 
 	return lastErr
 }

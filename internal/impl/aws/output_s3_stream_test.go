@@ -1,8 +1,12 @@
 package aws
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -42,6 +46,17 @@ path: 'data/${! timestamp_unix() }.json'
 max_buffer_bytes: 5242880
 max_buffer_count: 5000
 max_buffer_period: 5s
+`,
+			expectError: false,
+		},
+		{
+			name: "with file rotation settings",
+			config: `
+bucket: test-bucket
+path: 'data/${! timestamp_unix() }.json'
+max_file_bytes: 104857600
+max_file_count: 100000
+max_file_period: 1h
 `,
 			expectError: false,
 		},
@@ -303,6 +318,55 @@ max_buffer_period: 5s
 	}
 }
 
+func TestS3StreamOutputFileRotationSettings(t *testing.T) {
+	tests := []struct {
+		name           string
+		config         string
+		expectedBytes  int64
+		expectedCount  int
+		expectedPeriod string
+	}{
+		{
+			name: "default values",
+			config: `
+bucket: test-bucket
+path: 'logs/test.log'
+`,
+			expectedBytes:  0,
+			expectedCount:  0,
+			expectedPeriod: "0s",
+		},
+		{
+			name: "custom values",
+			config: `
+bucket: test-bucket
+path: 'logs/test.log'
+max_file_bytes: 104857600
+max_file_count: 50000
+max_file_period: 1h
+`,
+			expectedBytes:  104857600,
+			expectedCount:  50000,
+			expectedPeriod: "1h0m0s",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := s3StreamOutputSpec()
+			parsedConf, err := spec.ParseYAML(tt.config, nil)
+			require.NoError(t, err)
+
+			conf, err := s3StreamConfigFromParsed(parsedConf)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.expectedBytes, conf.MaxFileBytes)
+			assert.Equal(t, tt.expectedCount, conf.MaxFileCount)
+			assert.Equal(t, tt.expectedPeriod, conf.MaxFilePeriod.String())
+		})
+	}
+}
+
 func TestS3StreamOutputContentSettings(t *testing.T) {
 	configYAML := `
 bucket: test-bucket
@@ -370,4 +434,62 @@ path: 'logs/${! meta("filename") }.log'
 
 	// Each message should create its own partition
 	assert.NotEqual(t, path0, path1, "Paths should be different without partition_by")
+}
+
+func TestS3StreamOutputRotatesOnFileCount(t *testing.T) {
+	var createCalls int
+	var completeCalls int
+	var completedUploadIDs []string
+	mockClient := &mockS3StreamClient{
+		createMultipartUploadFunc: func(ctx context.Context, input *s3.CreateMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+			createCalls++
+			return &s3.CreateMultipartUploadOutput{
+				UploadId: aws.String(string(rune('a' + createCalls - 1))),
+			}, nil
+		},
+		completeMultipartUploadFunc: func(ctx context.Context, input *s3.CompleteMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+			completeCalls++
+			completedUploadIDs = append(completedUploadIDs, *input.UploadId)
+			return &s3.CompleteMultipartUploadOutput{}, nil
+		},
+	}
+
+	path, err := service.NewInterpolatedString("logs/${! uuid_v4() }.log")
+	require.NoError(t, err)
+	partitionBy, err := service.NewInterpolatedString("all")
+	require.NoError(t, err)
+	contentType, err := service.NewInterpolatedString("application/octet-stream")
+	require.NoError(t, err)
+
+	output, err := newS3StreamOutput(s3StreamConfig{
+		Bucket:          "test-bucket",
+		Path:            path,
+		PartitionBy:     []*service.InterpolatedString{partitionBy},
+		MaxBufferBytes:  10 * 1024 * 1024,
+		MaxBufferCount:  10000,
+		MaxBufferPeriod: time.Hour,
+		MaxFileCount:    2,
+		ContentType:     contentType,
+	}, service.MockResources())
+	require.NoError(t, err)
+	output.s3Client = mockClient
+
+	batch := service.MessageBatch{
+		service.NewMessage([]byte("one")),
+		service.NewMessage([]byte("two")),
+	}
+	require.NoError(t, output.WriteBatch(context.Background(), batch))
+
+	assert.Equal(t, 1, createCalls)
+	assert.Equal(t, 1, completeCalls)
+	assert.Equal(t, []string{"a"}, completedUploadIDs)
+	assert.Empty(t, output.writers)
+
+	require.NoError(t, output.WriteBatch(context.Background(), service.MessageBatch{
+		service.NewMessage([]byte("three")),
+	}))
+
+	assert.Equal(t, 2, createCalls)
+	assert.Equal(t, 1, completeCalls)
+	assert.Len(t, output.writers, 1)
 }

@@ -61,6 +61,9 @@ output:
     max_buffer_bytes: 10485760
     max_buffer_count: 10000
     max_buffer_period: 10s
+    max_file_bytes: 0
+    max_file_count: 0
+    max_file_period: 0s
     content_type: application/octet-stream
     content_encoding: "" # No default (optional)
     max_retries: 2
@@ -231,11 +234,35 @@ Default: `10000`
 
 ### `max_buffer_period`
 
-Maximum duration to buffer messages before flushing to S3.
+Maximum duration to buffer messages before flushing a part to S3.
 
 
 Type: `string`  
 Default: `"10s"`  
+
+### `max_file_bytes`
+
+Maximum number of bytes to write to an S3 object before completing the multipart upload and starting a new object for subsequent messages. Set to zero to disable byte based rotation.
+
+
+Type: `int`  
+Default: `0`  
+
+### `max_file_count`
+
+Maximum number of messages to write to an S3 object before completing the multipart upload and starting a new object for subsequent messages. Set to zero to disable count based rotation.
+
+
+Type: `int`  
+Default: `0`  
+
+### `max_file_period`
+
+Maximum age of an active S3 object before completing the multipart upload and starting a new object for subsequent messages. This threshold is evaluated when messages are written. Set to zero to disable age based rotation.
+
+
+Type: `string`  
+Default: `"0s"`  
 
 ### `content_type`
 
@@ -533,5 +560,4 @@ processors:
   - archive:
       format: json_array
 ```
-
 
