@@ -1,8 +1,10 @@
 package kafka
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Jeffail/gabs/v2"
 	"github.com/stretchr/testify/assert"
@@ -46,5 +48,33 @@ topics: %v
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), test.errStr)
 		})
+	}
+}
+
+func TestSyncCheckpointerLateAckAfterClaimCancellation(t *testing.T) {
+	reader := &kafkaReader{mgr: service.MockResources()}
+	checkpoint := reader.syncCheckpointer("foo", 0)
+	msgChan := make(chan asyncMessage)
+	claimCtx, cancelClaim := context.WithCancel(context.Background())
+
+	checkpointDone := make(chan bool, 1)
+	go func() {
+		checkpointDone <- checkpoint(claimCtx, msgChan, service.MessageBatch{service.NewMessage(nil)}, 1)
+	}()
+
+	msg := <-msgChan
+	cancelClaim()
+	require.False(t, <-checkpointDone)
+
+	ackDone := make(chan error, 1)
+	go func() {
+		ackDone <- msg.ackFn(context.Background(), nil)
+	}()
+
+	select {
+	case err := <-ackDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("late acknowledgement blocked after the claim was cancelled")
 	}
 }
