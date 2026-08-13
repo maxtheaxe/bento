@@ -369,14 +369,14 @@ func (k *kafkaReader) asyncCheckpointer(topic string, partition int32) func(cont
 
 func (k *kafkaReader) syncCheckpointer(topic string, partition int32) func(context.Context, chan<- asyncMessage, service.MessageBatch, int64) bool {
 	ackedChan := make(chan error)
-	return func(ctx context.Context, c chan<- asyncMessage, msg service.MessageBatch, offset int64) bool {
+	return func(claimCtx context.Context, c chan<- asyncMessage, msg service.MessageBatch, offset int64) bool {
 		if msg == nil {
 			return true
 		}
 		select {
 		case c <- asyncMessage{
 			msg: msg,
-			ackFn: func(ctx context.Context, res error) error {
+			ackFn: func(ackCtx context.Context, res error) error {
 				resErr := res
 				if resErr == nil {
 					k.cMut.Lock()
@@ -390,7 +390,8 @@ func (k *kafkaReader) syncCheckpointer(topic string, partition int32) func(conte
 				}
 				select {
 				case ackedChan <- resErr:
-				case <-ctx.Done():
+				case <-claimCtx.Done():
+				case <-ackCtx.Done():
 				}
 				return nil
 			},
@@ -401,10 +402,10 @@ func (k *kafkaReader) syncCheckpointer(topic string, partition int32) func(conte
 					k.mgr.Logger().Errorf("Received error from message batch: %v, shutting down consumer.\n", resErr)
 					return false
 				}
-			case <-ctx.Done():
+			case <-claimCtx.Done():
 				return false
 			}
-		case <-ctx.Done():
+		case <-claimCtx.Done():
 			return false
 		}
 		return true
