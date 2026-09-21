@@ -43,6 +43,21 @@ Delivery guarantees [can be a dodgy subject](https://youtu.be/QmpBOCvY8mY). Bent
 
 This behaviour is the default and free of caveats, which also makes deploying and scaling Bento much simpler.
 
+## Lancaster `ls` image
+
+The `ls` branch combines these custom changes on top of Bento:
+
+| Source branch | Included change |
+| --- | --- |
+| [`feat/redis-hash-scan`](https://github.com/maxtheaxe/bento/tree/feat/redis-hash-scan) | Redis `redis_scan` hash support and raw values |
+| [`fix/delay-ack-s3-stream`](https://github.com/maxtheaxe/bento/tree/fix/delay-ack-s3-stream) | `aws_s3_stream` upload completion and acknowledgement behavior |
+| [`fix/kafka-rebalance-deadlock`](https://github.com/maxtheaxe/bento/tree/fix/kafka-rebalance-deadlock) | Kafka rebalance acknowledgement deadlock fix |
+
+The published Docker Hub image is `maxtheaxe/bento:ls` (immutable tag
+`maxtheaxe/bento:ls-52d0b0564`), built from commit
+[`52d0b0564f9c632f30d8f44e0a47d4585890ffa3`](https://github.com/maxtheaxe/bento/commit/52d0b0564f9c632f30d8f44e0a47d4585890ffa3).
+The `fix/csv-scanner-read-errors` change is published separately and is not in this image.
+
 ## Supported Sources & Sinks
 
 AWS (DynamoDB, Kinesis, S3, SQS, SNS), Azure (Blob storage, Queue storage, Table storage), GCP (Pub/Sub, Cloud storage, Big query), Kafka, NATS (JetStream, Streaming), NSQ, MQTT, AMQP 0.91 (RabbitMQ), AMQP 1, Redis (streams, list, pubsub, hashes), Cassandra, Elasticsearch, HDFS, HTTP (server and client, including websockets), MongoDB, SQL (MySQL, PostgreSQL, Clickhouse, MSSQL), and [you know what just click here to see them all, they don't fit in a README][about-categories].
