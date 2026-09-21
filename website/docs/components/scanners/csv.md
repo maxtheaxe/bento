@@ -62,7 +62,7 @@ Default: `false`
 
 ### `continue_on_error`
 
-If a row fails to parse due to any error emit an empty message marked with the error and then continue consuming subsequent rows when possible. This can sometimes be useful in situations where input data contains individual rows which are malformed. However, when a row encounters a parsing error it is impossible to guarantee that following rows are valid, as this indicates that the input data is unreliable and could potentially emit misaligned rows.
+If a row fails to parse due to a CSV parsing error, emit a message marked with the error and then continue consuming subsequent rows when possible. Errors reading the underlying stream always stop the scan. This can sometimes be useful in situations where input data contains individual rows which are malformed. However, when a row encounters a parsing error it is impossible to guarantee that following rows are valid, as this indicates that the input data is unreliable and could potentially emit misaligned rows.
 
 
 Type: `bool`  
